@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -23,8 +24,18 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+# Custom Service Interface Generation
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/NavigateToWaypoint.srv"
+  DEPENDENCIES geometry_msgs
+)
+
 add_executable(pose_pid_controller src/pose_pid_controller.cpp)
 ament_target_dependencies(pose_pid_controller rclcpp geometry_msgs nav_msgs)
+
+# Link generated service interface header to node
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(pose_pid_controller "${cpp_typesupport_target}")
 
 install(TARGETS
   pose_pid_controller

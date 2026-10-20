@@ -1,62 +1,82 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <string>
 
+#include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
-#include "rclcpp/rclcpp.hpp"
+#include "diff_drive_control/srv/navigate_to_waypoint.hpp"
 
 using namespace std::chrono_literals;
 
 class PosePidController : public rclcpp::Node {
 public:
-  PosePidController() : Node("pose_pid_controller"), x_(0.0), y_(0.0), yaw_(0.0) {
-    // Target coordinates and controller gains
-    this->declare_parameter<double>("x_goal", 2.0);
-    this->declare_parameter<double>("y_goal", 2.0);
+  PosePidController() : Node("pose_pid_controller") {
+    // Declare & initialize parameters
+    this->declare_parameter<double>("kp_linear", 1.0);
     this->declare_parameter<double>("kp_angular", 2.0);
-    this->declare_parameter<double>("kp_linear", 0.5);
     this->declare_parameter<double>("goal_tolerance", 0.05);
 
     // Publishers & Subscribers
-    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/odom", 10, std::bind(&PosePidController::odomCallback, this, std::placeholders::_1));
-    
     cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      "/odom", 10, std::bind(&PosePidController::odom_callback, this, std::placeholders::_1));
 
-    // Control Loop Timer (20 Hz)
-    timer_ = this->create_wall_timer(50ms, std::bind(&PosePidController::controlLoop, this));
+    // Create Service Server (/navigate_to_waypoint)
+    service_ = this->create_service<diff_drive_control::srv::NavigateToWaypoint>(
+      "/navigate_to_waypoint",
+      std::bind(&PosePidController::handle_waypoint_request, this,
+                std::placeholders::_1, std::placeholders::_2));
 
-    RCLCPP_INFO(this->get_logger(), "Pose PID Controller Node Initialized.");
+    // 20Hz Control Loop Timer
+    timer_ = this->create_wall_timer(
+      50ms, std::bind(&PosePidController::control_loop, this));
+
+    RCLCPP_INFO(this->get_logger(), "Pose PID Controller with Waypoint Service Initialized.");
   }
 
 private:
-  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    x_ = msg->pose.pose.position.x;
-    y_ = msg->pose.pose.position.y;
+  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    current_x_ = msg->pose.pose.position.x;
+    current_y_ = msg->pose.pose.position.y;
 
-    // Convert orientation quaternion to yaw (z-axis rotation)
+    // Quaternion to Yaw conversion
+    double qx = msg->pose.pose.orientation.x;
+    double qy = msg->pose.pose.orientation.y;
     double qz = msg->pose.pose.orientation.z;
     double qw = msg->pose.pose.orientation.w;
-    yaw_ = std::atan2(2.0 * (qw * qz), 1.0 - 2.0 * (qz * qz));
+    current_theta_ = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
   }
 
-  void controlLoop() {
-    double target_x = this->get_parameter("x_goal").as_double();
-    double target_y = this->get_parameter("y_goal").as_double();
-    double kp_ang = this->get_parameter("kp_angular").as_double();
-    double kp_lin = this->get_parameter("kp_linear").as_double();
-    double tolerance = this->get_parameter("goal_tolerance").as_double();
+  void handle_waypoint_request(
+    const std::shared_ptr<diff_drive_control::srv::NavigateToWaypoint::Request> request,
+    std::shared_ptr<diff_drive_control::srv::NavigateToWaypoint::Response> response) {
+    
+    goal_x_ = request->x;
+    goal_y_ = request->y;
+    has_active_goal_ = true;
 
-    // Compute error components
-    double ex = target_x - x_;
-    double ey = target_y - y_;
-    double distance_error = std::sqrt(ex * ex + ey * ey);
+    RCLCPP_INFO(this->get_logger(), "Received New Waypoint Request: x=%.2f, y=%.2f", goal_x_, goal_y_);
+
+    response->success = true;
+    response->message = "Waypoint set successfully. Navigating...";
+  }
+
+  void control_loop() {
+    if (!has_active_goal_) return;
+
+    double dx = goal_x_ - current_x_;
+    double dy = goal_y_ - current_y_;
+    double distance = std::sqrt(dx * dx + dy * dy);
+
+    double kp_linear = this->get_parameter("kp_linear").as_double();
+    double kp_angular = this->get_parameter("kp_angular").as_double();
+    double tolerance = this->get_parameter("goal_tolerance").as_double();
 
     geometry_msgs::msg::Twist cmd;
 
-    // Check goal condition
-    if (distance_error < tolerance) {
+    if (distance < tolerance) {
       cmd.linear.x = 0.0;
       cmd.angular.z = 0.0;
       cmd_vel_pub_->publish(cmd);
@@ -64,29 +84,29 @@ private:
       return;
     }
 
-    // Heading error normalized to [-PI, PI]
-    double target_yaw = std::atan2(ey, ex);
-    double yaw_error = target_yaw - yaw_;
-    yaw_error = std::atan2(std::sin(yaw_error), std::cos(yaw_error));
+    double desired_heading = std::atan2(dy, dx);
+    double heading_error = desired_heading - current_theta_;
 
-    // Proportional angular control
-    cmd.angular.z = kp_ang * yaw_error;
-    
-    // Linear control scaled by cosine of heading error
-    cmd.linear.x = kp_lin * distance_error * std::cos(yaw_error);
+    // Normalize angle to [-pi, pi]
+    while (heading_error > M_PI) heading_error -= 2.0 * M_PI;
+    while (heading_error < -M_PI) heading_error += 2.0 * M_PI;
 
-    // Velocity clamping for safety
-    cmd.linear.x = std::max(-0.5, std::min(0.5, cmd.linear.x));
-    cmd.angular.z = std::max(-1.0, std::min(1.0, cmd.angular.z));
+    cmd.linear.x = std::min(kp_linear * distance, 0.5);
+    cmd.angular.z = std::clamp(kp_angular * heading_error, -1.0, 1.0);
 
     cmd_vel_pub_->publish(cmd);
   }
 
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  // ROS 2 Interfaces
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Service<diff_drive_control::srv::NavigateToWaypoint>::SharedPtr service_;
   rclcpp::TimerBase::SharedPtr timer_;
 
-  double x_, y_, yaw_;
+  // Internal State Variables
+  double current_x_{0.0}, current_y_{0.0}, current_theta_{0.0};
+  double goal_x_{0.0}, goal_y_{0.0};
+  bool has_active_goal_{false};
 };
 
 int main(int argc, char **argv) {
